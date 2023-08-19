@@ -1,0 +1,273 @@
+import os
+import ccxt
+import schedule
+import time
+from tabulate import tabulate
+from dotenv import load_dotenv
+from datetime import datetime, timedelta
+import ntplib
+import numpy as np
+import asyncio
+import nest_asyncio
+import threading
+import json
+import talib
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Create an empty list to store trading signals
+trading_signals = []
+
+# Fetch API credentials from environment variables
+API_KEY = os.getenv('API_KEY')
+SECRET_KEY = os.getenv('SECRET_KEY')
+PASSPHRASE = os.getenv('PASSPHRASE')
+
+# Initialize the KuCoin Futures exchange instance
+exchange = ccxt.kucoinfutures({
+    'apiKey': API_KEY,
+    'secret': SECRET_KEY,
+    'password': PASSPHRASE,
+    'enableRateLimit': True  # Adjust as needed
+})
+        
+def calculate_atr(high_prices, low_prices, close_prices, period=14):
+    atr = talib.ATR(high_prices, low_prices, close_prices, timeperiod=period)
+    return atr[-1]  # Return the last value of ATR
+
+def calculate_rsi(data, period=14):
+    rsi = talib.RSI(data, timeperiod=period)
+    return rsi[-1]  # Return the last value of RSI
+
+# Function to calculate the adaptive bin size based on volatility
+def calculate_adaptive_bin_size(volatility, max_bins=10):
+    return max(1, min(int(volatility * max_bins), max_bins))
+
+def calculate_smoothed_imbalance(data, alpha=0.1):
+    smoothed_data = [data[0]]  # Initialize with the first data value
+    for i in range(1, len(data)):
+        smoothed_data.append(alpha * data[i] + (1 - alpha) * smoothed_data[i - 1])
+    return smoothed_data
+
+def fetch_ohlcv_and_analyze_order_book(symbol, depth=20, max_retries=3):
+    retries = 0
+    # Initialize a list to store historical imbalance percentages
+    historical_imbalance_percentage = []
+    
+    while retries < max_retries:
+        try:
+            # Fetch OHLCV data for ATR and TR calculation
+            ohlcv_data = exchange.fetch_ohlcv(symbol, '15m')  # Adjust timeframe as needed
+            close_prices = np.array([item[4] for item in ohlcv_data])
+            high_prices = np.array([item[2] for item in ohlcv_data])
+            low_prices = np.array([item[3] for item in ohlcv_data])
+
+            # Calculate True Range (TR)
+            tr = [max(hl, hc, lc) - min(hl, hc, lc) for hl, hc, lc in zip(high_prices, close_prices, low_prices)]
+
+            # Calculate ATR using TA-Lib
+            atr = talib.ATR(high_prices, low_prices, close_prices, timeperiod=14)[-1]
+
+            # Calculate RSI using TA-Lib
+            rsi = talib.RSI(close_prices, timeperiod=14)[-1]
+
+            # Fetch the order book for the specified symbol and depth
+            order_book = exchange.fetch_order_book(symbol, limit=depth)
+            bids = order_book['bids']
+            asks = order_book['asks']
+            
+            # Calculate the total volume of bids and asks
+            total_bids_volume = sum(bid[1] for bid in bids)
+            total_asks_volume = sum(ask[1] for ask in asks)
+
+            # Calculate the current order book imbalance percentage
+            current_imbalance_percentage = ((total_bids_volume - total_asks_volume) / (total_bids_volume + total_asks_volume)) * 100
+
+            # Calculate the weighted order book imbalance using the midpoint of bid and ask prices
+            weighted_bids_volume = sum(bid[1] * (bid[0] + ask[0]) / 2 for bid, ask in zip(bids, asks))
+            weighted_asks_volume = sum(ask[1] * (bid[0] + ask[0]) / 2 for bid, ask in zip(bids, asks))
+
+            if weighted_bids_volume + weighted_asks_volume != 0:
+                current_weighted_imbalance_percentage = (weighted_bids_volume - weighted_asks_volume) / (weighted_bids_volume + weighted_asks_volume) * 100
+            else:
+                current_weighted_imbalance_percentage = 0  # Default value when the total volume is zero
+
+            # Print order book analysis results
+            print(f"Order Book Analysis for {symbol} - Imbalance: {current_imbalance_percentage:.2f}% (Weighted Imbalance: {current_weighted_imbalance_percentage:.2f}%) - RSI: {rsi:.2f}")
+            
+            # Append the current imbalance percentage to the historical list
+            historical_imbalance_percentage.append(current_imbalance_percentage)
+            
+            # Calculate adaptive bin size based on volatility
+            volatility = np.std(close_prices[-20:])  # Adjust the period as needed
+            bin_size = calculate_adaptive_bin_size(volatility)
+
+            # Calculate smoothed order book imbalance using EMA
+            smoothed_imbalance = calculate_smoothed_imbalance(historical_imbalance_percentage)
+
+            # Generate trading signal and proposed entry price based on RSI and order book imbalance
+            trading_signal, proposed_entry_price = generate_trading_signal(
+                rsi,
+                current_imbalance_percentage,
+                close_prices,
+                high_prices,  # Add this argument
+                low_prices,   # Add this argument
+                bids,
+                asks
+            )
+            print("Trading Signal:", trading_signal)
+            if proposed_entry_price:
+                print("Proposed Entry Price:", proposed_entry_price)
+            print("=" * 50)
+            
+            # Return the calculated values
+            return rsi, current_imbalance_percentage, close_prices, high_prices, low_prices, bids, asks
+            
+            # Exit the retry loop if data is successfully fetched and analyzed
+            break
+            
+        except Exception as e:
+            retries += 1
+            print(f"Error fetching or analyzing order book: {e}")
+            print(f"Retrying... ({retries}/{max_retries})")
+            time.sleep(10)  # Wait for 10 seconds before retrying
+
+def generate_trading_signal(rsi, imbalance_percentage, close_prices, high_prices, low_prices, bids, asks):
+    # Calculate the RSI divergence threshold (adjust as needed)
+    rsi_divergence_threshold = 5
+    
+    # Calculate ATR using high_prices and low_prices
+    atr = calculate_atr(high_prices, low_prices, close_prices)
+    
+    if imbalance_percentage >= 6:  # Positive imbalance condition
+        # Check for bullish RSI divergence (oversold RSI)
+        if rsi < 30:
+            proposed_entry_price = bids[0][0]
+            return "Validated Bullish Divergence (Long)", proposed_entry_price
+    elif imbalance_percentage <= -5:  # Negative imbalance condition
+        # Check for bearish RSI divergence (overbought RSI)
+        if rsi > 70:
+            proposed_entry_price = asks[0][0]
+            return "Validated Bearish Divergence (Short)", proposed_entry_price
+    else:
+        # Check for hidden bullish divergence (higher low in RSI)
+        if rsi < 30 and rsi + rsi_divergence_threshold < calculate_rsi(close_prices[-2:], atr):
+            proposed_entry_price = bids[0][0]
+            return "Hidden Bullish Divergence (Long)", proposed_entry_price
+        
+        # Check for hidden bearish divergence (lower high in RSI)
+        if rsi > 70 and rsi - rsi_divergence_threshold > calculate_rsi(close_prices[-2:], atr):
+            proposed_entry_price = asks[0][0]
+            return "Hidden Bearish Divergence (Short)", proposed_entry_price
+    
+    return "No Entry", None
+        
+# Modify the create_order_with_stop_loss_take_profit function
+def create_order_with_stop_loss_take_profit(exchange, symbol, side, entry_price, leverage, amount):
+    try:
+        # Calculate stop-loss and take-profit prices based on percentages
+        stop_loss_percentage = 15.0  # 10%
+        take_profit_percentage = 10.0  # 15%
+        stop_loss_price = entry_price * (1.0 - stop_loss_percentage / 100.0)
+        take_profit_price = entry_price * (1.0 + take_profit_percentage / 100.0)
+
+        # Print the calculated stop loss and take profit values
+        print("Calculated Stop Loss Price:", stop_loss_price)
+        print("Calculated Take Profit Price:", take_profit_price)
+
+        # Create the main limit order with leverage
+        main_order = exchange.create_order(
+            symbol,
+            type='limit',
+            side=side,
+            amount=amount,
+            price=entry_price,
+            params={
+                'postOnly': True,
+                'timeInForce': 'GTC',
+                'leverage': leverage
+            }
+        )
+        print("Main Order Created:", main_order)
+
+        # Create the stop-loss order
+        stop_loss_order = exchange.create_order(
+            symbol,
+            type='limit',
+            side='sell' if side == 'buy' else 'buy',
+            amount=amount,
+            price=stop_loss_price
+        )
+        print("Stop-Loss Order Created:", stop_loss_order)
+
+        # Create the take-profit order
+        take_profit_order = exchange.create_order(
+            symbol,
+            type='limit',
+            side='sell' if side == 'buy' else 'buy',
+            amount=amount,
+            price=take_profit_price
+        )
+        print("Take-Profit Order Created:", take_profit_order)
+
+        return main_order, stop_loss_order, take_profit_order
+    except Exception as e:
+        print(f"Error creating orders with stop loss and take profit: {e}")
+        return None, None, None
+
+# Modify the execute_order_book_analysis function
+def execute_order_book_analysis(symbol, leverage, amount):
+    while True:
+        fetch_ohlcv_and_analyze_order_book(symbol)
+        
+        # Fetch OHLCV data and analyze order book
+        rsi, imbalance_percentage, close_prices, high_prices, low_prices, bids, asks = fetch_ohlcv_and_analyze_order_book(symbol)
+        
+        # Generate trading signal and proposed entry price based on RSI and order book imbalance
+        trading_signal, proposed_entry_price = generate_trading_signal(
+            rsi,
+            imbalance_percentage,
+            close_prices,
+            high_prices,
+            low_prices,
+            bids,
+            asks
+        )
+        
+        # Inside execute_order_book_analysis
+        if trading_signal != "No Entry" and proposed_entry_price:
+            # Create a limit order based on the signal
+            if trading_signal.startswith("Validated Bullish"):
+                create_order_with_stop_loss_take_profit(exchange, symbol, 'buy', proposed_entry_price, leverage, amount)
+            elif trading_signal.startswith("Validated Bearish"):
+                create_order_with_stop_loss_take_profit(exchange, symbol, 'sell', proposed_entry_price, leverage, amount)
+        
+        time.sleep(240)  # Sleep for 60 seconds before fetching again
+
+# Save trading signals to a JSON file
+def save_trading_signals_to_json():
+    with open("ob_signal.json", "w") as json_file:
+        json.dump(trading_signals, json_file, indent=4)
+
+# Run the save function in the background
+save_thread = threading.Thread(target=save_trading_signals_to_json)
+save_thread.start()
+
+# List of symbols to analyze
+symbols_to_analyze = ['BTC/USDT:USDT', 'ETH/USDT:USDT']  # Add more symbols as needed
+
+# Define leverage and amount
+leverage = 50  # Define your desired leverage
+amount = 10     # Define your desired amount
+
+# Create and start a separate thread for each symbol
+order_book_threads = []
+for symbol in symbols_to_analyze:
+    thread = threading.Thread(target=execute_order_book_analysis, args=(symbol, leverage, amount))
+    order_book_threads.append(thread)
+    thread.start()
+
+# Wait for all threads to finish
+for thread in order_book_threads:
+    thread.join()
